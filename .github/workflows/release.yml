@@ -49,3 +49,35 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
             --title "ncompose ${GITHUB_REF_NAME#v}" --generate-notes
+
+      # Points the Homebrew formula at the new release. TAP_DEPLOY_KEY is the private half
+      # of a write-enabled deploy key on mach25/homebrew-ncompose.
+      - name: Update the Homebrew formula
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$TAP_DEPLOY_KEY" ]; then
+            echo "::error::TAP_DEPLOY_KEY is not set; update Formula/ncompose.rb in mach25/homebrew-ncompose by hand"
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          name="ncompose-$version-macos-universal"
+          sha=$(cut -d' ' -f1 "dist/$name.tar.gz.sha256")
+          key="$RUNNER_TEMP/tap_key"
+          (umask 077 && printf '%s\n' "$TAP_DEPLOY_KEY" > "$key")
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 git@github.com:mach25/homebrew-ncompose.git "$RUNNER_TEMP/tap"
+          cd "$RUNNER_TEMP/tap"
+          sed -i '' -E \
+            -e "s|^  url \".*\"|  url \"https://github.com/mach25/ncompose/releases/download/$GITHUB_REF_NAME/$name.tar.gz\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
+            Formula/ncompose.rb
+          git diff
+          if git diff --quiet; then
+            echo "formula already points at $version"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -am "ncompose $version"
+          git push origin HEAD:main
+          rm -f "$key"
