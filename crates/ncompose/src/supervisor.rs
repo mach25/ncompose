@@ -629,13 +629,31 @@ mod tests {
         assert!(http_ok(canned(&[b"HTT", b"P/1.1 2", b"00 OK\r\n\r\n"]).await, "/").await.unwrap());
     }
 
+    /// The dylib this `cargo test` built (a dev-dependency), in target/<profile>/deps.
+    fn test_shim() -> PathBuf {
+        let deps = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let dylib = deps.join("libncompose_shim.dylib");
+        assert!(dylib.exists(), "{} not built", dylib.display());
+        dylib
+    }
+
+    /// A do-nothing service process: this test binary, re-run to sleep. (Not /bin/sleep:
+    /// Apple's binaries are arm64e and cannot load the arm64 shim, which matters where
+    /// SIP is off, as on CI runners.)
+    #[test]
+    fn sleep_child() {
+        if let Ok(secs) = std::env::var("NC_SLEEP_CHILD") {
+            std::thread::sleep(Duration::from_secs(secs.parse().unwrap()));
+        }
+    }
+
     fn sleeper(name: &str, depends_on: &[&str]) -> Service {
         Service {
             name: name.into(),
-            binary: "/bin/sleep".into(),
-            args: vec!["30".into()],
+            binary: std::env::current_exe().unwrap(),
+            args: ["--exact", "supervisor::tests::sleep_child", "--test-threads=1"].map(String::from).to_vec(),
             workdir: std::env::temp_dir(),
-            env: vec![],
+            env: vec![("NC_SLEEP_CHILD".into(), "30".into())],
             ip: Ipv4Addr::LOCALHOST,
             networks: vec![],
             ports: vec![],
@@ -659,7 +677,9 @@ mod tests {
             paths,
             state: Mutex::new(State::default()),
             out: Output { console: false, color: false, width: 8 },
-            shim: "/nonexistent/libncompose_shim.dylib".into(),
+            // The real shim: dyld aborts a process whose inserted library is missing,
+            // and only SIP (off on CI runners) would have hidden that for /bin/sleep.
+            shim: test_shim(),
             shutdown,
             ready: HashMap::from([("db".to_string(), dep_ready.clone()), ("api".to_string(), watch::channel(false).0)]),
             dns: HashMap::new(),

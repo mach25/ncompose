@@ -172,6 +172,8 @@ ncompose works at the libc level, so:
   `DYLD_INSERT_LIBRARIES` and see the real network. `ncompose config` and `up` warn about them.
   Your own binaries and Homebrew's work. A hardened binary you control can be re-signed ad hoc:
   `codesign -f -s - <binary>`.
+  With SIP off, Apple's own binaries do load inserted libraries, but they are arm64e and the shim
+  is arm64, so dyld refuses to start them under ncompose.
 - **The filesystem is shared.** Unix sockets, lock files and data directories are not isolated.
   Give each service its own paths (for PostgreSQL, `unix_socket_directories`).
 - **Wildcard listeners shadow service addresses.** Until a service has bound `ip:port`, any host

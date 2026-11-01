@@ -418,6 +418,7 @@ dependencies = [
  "clap",
  "indexmap",
  "libc",
+ "ncompose-shim",
  "serde",
  "serde_json",
  "serde_yaml",
