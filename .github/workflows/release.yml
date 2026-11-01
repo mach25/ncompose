@@ -1,0 +1,51 @@
+# Builds universal (arm64 + x86_64) macOS binaries for a version tag and publishes
+# them as a GitHub release:  git tag v0.0.1 && git push origin v0.0.1
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Check the tag matches the crate version
+        run: |
+          crate=$(cargo pkgid -p ncompose | sed 's/.*[#@]//')
+          test "${GITHUB_REF_NAME#v}" = "$crate" || { echo "tag $GITHUB_REF_NAME != crate $crate"; exit 1; }
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p ncompose -p ncompose-shim --target aarch64-apple-darwin --target x86_64-apple-darwin
+
+      - name: Package
+        run: |
+          name="ncompose-${GITHUB_REF_NAME#v}-macos-universal"
+          mkdir -p "dist/$name/bin" "dist/$name/lib"
+          for f in bin/ncompose lib/libncompose_shim.dylib; do
+            lipo -create target/{aarch64,x86_64}-apple-darwin/release/$(basename $f) -output "dist/$name/$f"
+            codesign --force --sign - "dist/$name/$f"
+          done
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          lipo -info "dist/$name/bin/ncompose" "dist/$name/lib/libncompose_shim.dylib"
+          cat dist/*.sha256
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --title "ncompose ${GITHUB_REF_NAME#v}" --generate-notes

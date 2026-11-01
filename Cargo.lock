@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "echo-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "futures-util",
  "http-body-util",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "ncompose"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "ncompose-shim"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "libc",
 ]
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "testsvc"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "thiserror"

@@ -72,13 +72,24 @@ The design notes are in [`macos-native-compose.md`](macos-native-compose.md).
 ## Requirements
 
 - macOS on Apple Silicon. Intel Macs are untested but nothing is arm64-specific.
-- A Rust toolchain (`rustup`), to build.
+- A Rust toolchain (`rustup`), only to build from source.
 - Administrator rights **once**, to install the loopback alias pool.
 
 ## Install
 
+With [Homebrew](https://brew.sh):
+
 ```sh
-git clone <this repository> ncompose && cd ncompose
+brew install mach25/ncompose/ncompose
+ncompose system install
+```
+
+Prebuilt universal (arm64 + x86_64) binaries are also on the
+[releases page](https://github.com/mach25/ncompose/releases): unpack the archive and keep
+`bin/` and `lib/` side by side. From source:
+
+```sh
+git clone https://github.com/mach25/ncompose && cd ncompose
 cargo build --release
 target/release/ncompose system install
 ```
@@ -91,7 +102,7 @@ After that, `up` and `down` never need root.
 - `system status` shows what is present; `system uninstall --remove-aliases` removes it all.
 - Without the daemon, `up` falls back to adding missing aliases with `sudo`.
 
-Keep `ncompose` and `libncompose_shim.dylib` together; the CLI finds the library next to itself.
+Keep `ncompose` and `libncompose_shim.dylib` together; the CLI finds the library next to itself or in `../lib`.
 Set `NCOMPOSE_SHIM` to point elsewhere.
 
 ## The compose file
