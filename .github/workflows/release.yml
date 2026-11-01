@@ -1,5 +1,9 @@
-# Builds universal (arm64 + x86_64) macOS binaries for a version tag and publishes
-# them as a GitHub release:  git tag v0.0.1 && git push origin v0.0.1
+# Builds universal (arm64 + x86_64) macOS binaries for a version tag, publishes
+# them as a GitHub release, and points the Homebrew tap at them:
+#   git tag v0.0.1 && git push origin v0.0.1
+#
+# Both jobs can be re-run on their own: publishing skips what already exists, and
+# the tap update is a separate job that only needs the release job's outputs.
 name: release
 
 on:
@@ -12,6 +16,9 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    outputs:
+      name: ${{ steps.meta.outputs.name }}
+      sha256: ${{ steps.package.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,9 +26,12 @@ jobs:
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Check the tag matches the crate version
+        id: meta
         run: |
+          version="${GITHUB_REF_NAME#v}"
           crate=$(cargo pkgid -p ncompose | sed 's/.*[#@]//')
-          test "${GITHUB_REF_NAME#v}" = "$crate" || { echo "tag $GITHUB_REF_NAME != crate $crate"; exit 1; }
+          test "$version" = "$crate" || { echo "::error::tag $GITHUB_REF_NAME != crate version $crate"; exit 1; }
+          echo "name=ncompose-$version-macos-universal" >> "$GITHUB_OUTPUT"
 
       - name: Test
         run: cargo test --workspace --locked
@@ -30,54 +40,69 @@ jobs:
         run: cargo build --release --locked -p ncompose -p ncompose-shim --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Package
+        id: package
+        env:
+          NAME: ${{ steps.meta.outputs.name }}
         run: |
-          name="ncompose-${GITHUB_REF_NAME#v}-macos-universal"
-          mkdir -p "dist/$name/bin" "dist/$name/lib"
+          mkdir -p "dist/$NAME/bin" "dist/$NAME/lib"
           for f in bin/ncompose lib/libncompose_shim.dylib; do
-            lipo -create target/{aarch64,x86_64}-apple-darwin/release/$(basename $f) -output "dist/$name/$f"
-            codesign --force --sign - "dist/$name/$f"
+            lipo -create target/{aarch64,x86_64}-apple-darwin/release/$(basename $f) -output "dist/$NAME/$f"
+            codesign --force --sign - "dist/$NAME/$f"
           done
-          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
-          lipo -info "dist/$name/bin/ncompose" "dist/$name/lib/libncompose_shim.dylib"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          lipo -info "dist/$NAME/bin/ncompose" "dist/$NAME/lib/libncompose_shim.dylib"
           cat dist/*.sha256
+          echo "sha256=$(cut -d' ' -f1 "dist/$NAME.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
-            --title "ncompose ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "ncompose ${GITHUB_REF_NAME#v}" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber
 
-      # Points the Homebrew formula at the new release. TAP_DEPLOY_KEY is the private half
-      # of a write-enabled deploy key on mach25/homebrew-ncompose.
+  # Points Formula/ncompose.rb in <owner>/homebrew-ncompose at the new archive.
+  # TAP_DEPLOY_KEY is the private half of a write-enabled deploy key on that repository.
+  tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
       - name: Update the Homebrew formula
         env:
+          GH_TOKEN: ${{ github.token }}
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          NAME: ${{ needs.release.outputs.name }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
         run: |
           if [ -z "$TAP_DEPLOY_KEY" ]; then
-            echo "::error::TAP_DEPLOY_KEY is not set; update Formula/ncompose.rb in mach25/homebrew-ncompose by hand"
+            echo "::error::TAP_DEPLOY_KEY is not set; update Formula/ncompose.rb in $GITHUB_REPOSITORY_OWNER/homebrew-ncompose by hand"
             exit 1
           fi
           version="${GITHUB_REF_NAME#v}"
-          name="ncompose-$version-macos-universal"
-          sha=$(cut -d' ' -f1 "dist/$name.tar.gz.sha256")
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$NAME.tar.gz"
+
           key="$RUNNER_TEMP/tap_key"
+          trap 'rm -f "$key"' EXIT
           (umask 077 && printf '%s\n' "$TAP_DEPLOY_KEY" > "$key")
-          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-          git clone --depth 1 git@github.com:mach25/homebrew-ncompose.git "$RUNNER_TEMP/tap"
+          # Pin GitHub's published host keys instead of trusting whatever answers first.
+          gh api meta --jq '.ssh_keys[]' | sed 's/^/github.com /' > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+
+          git clone --depth 1 "git@github.com:$GITHUB_REPOSITORY_OWNER/homebrew-ncompose.git" "$RUNNER_TEMP/tap"
           cd "$RUNNER_TEMP/tap"
-          sed -i '' -E \
-            -e "s|^  url \".*\"|  url \"https://github.com/mach25/ncompose/releases/download/$GITHUB_REF_NAME/$name.tar.gz\"|" \
-            -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
+          sed -i -E \
+            -e "s|^  url \".*\"|  url \"$url\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" \
             Formula/ncompose.rb
-          git diff
-          if git diff --quiet; then
+          grep -Fq "$url" Formula/ncompose.rb && grep -Fq "$SHA256" Formula/ncompose.rb \
+            || { echo "::error::Formula/ncompose.rb has no url/sha256 lines the update recognises"; exit 1; }
+          if git --no-pager diff --exit-code; then
             echo "formula already points at $version"
             exit 0
           fi
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -am "ncompose $version"
-          git push origin HEAD:main
-          rm -f "$key"
+          git push origin HEAD
