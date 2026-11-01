@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/shim", "crates/ncompose", "crates/testsvc", "crates/echo-server"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,13 @@
+[package]
+name = "ncompose-shim"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "ncompose_shim"
+# rlib too: integration tests then depend on the library, so `cargo test` rebuilds the dylib they inject.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"

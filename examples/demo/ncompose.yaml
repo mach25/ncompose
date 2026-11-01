@@ -1,0 +1,34 @@
+# Demo: three copies of the same test server, all binding 0.0.0.0:8080.
+# Build first:  cargo build   (from the repo root)
+name: demo
+
+networks:
+  backend: { subnet: 127.10.0.0/24 }
+
+services:
+  api:
+    binary: ../../target/debug/testsvc     # binds 0.0.0.0:8080 by default
+    networks: [backend]
+    ports: ["18080:8080"]                  # published on the host
+    env:
+      NAME: api
+    restart: on-failure
+    depends_on: [db]
+
+  db:
+    binary: ../../target/debug/testsvc     # same port, no conflict
+    networks: [backend]                    # reachable as "db", not published
+    env:
+      NAME: db
+
+  worker:
+    binary: ../../target/debug/testsvc
+    networks: [backend]
+    env:
+      NAME: worker
+
+proxy:
+  listen: 8088
+  routes:
+    app.localhost: api:8080
+    db.localhost: db:8080

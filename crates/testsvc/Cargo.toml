@@ -1,0 +1,8 @@
+[package]
+name = "testsvc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Tiny HTTP service used to test ncompose networking"
+
+[dependencies]

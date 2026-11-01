@@ -1,0 +1,50 @@
+# DANN (native GraalVM images) + PostgreSQL, mirroring ~/dann-security/docker-compose.yml.
+# One-time:  ./setup-db.sh
+name: dann
+
+networks:
+  backend: { subnet: 127.10.0.0/24 }
+
+services:
+  db:
+    binary: postgres                    # Homebrew PostgreSQL; binds its default "localhost":5432
+    args: ["-D", ".data/pg"]
+    networks: [backend]
+    ports: ["15432:5432"]               # host already has its own postgres on 5432
+    stop_timeout: 20
+
+  dann-console:
+    binary: ~/dann-security/dann-console/target/dann-console
+    networks: [backend]
+    ports: ["8081:8080"]
+    depends_on: [db]
+    healthcheck: { http: /actuator/health/liveness, port: 8080 }
+    restart: on-failure
+    env:
+      SPRING_R2DBC_URL: "r2dbc:postgresql://db:5432/dann"
+      SPRING_R2DBC_USERNAME: dann
+      SPRING_R2DBC_PASSWORD: dann
+      SPRING_LIQUIBASE_URL: "jdbc:postgresql://db:5432/dann"
+      SPRING_LIQUIBASE_USER: dann
+      SPRING_LIQUIBASE_PASSWORD: dann
+      SPRING_LIQUIBASE_ENABLED: true          # migrate on start (dev convenience)
+      DANN_CONSOLE_SETUP_KEY: local-development-setup-key-0123456789
+      DANN_SECURITY_JWT_SECRET: "Wake Up DANN of Thursday Save the world!"
+
+  dann-access:
+    binary: ~/dann-security/dann-access/target/dann-access
+    networks: [backend]                 # also binds 8080 - no conflict with dann-console
+    ports: ["8080:8080"]
+    depends_on: [db, dann-console]      # waits until the console (the migrator) is healthy
+    healthcheck: { http: /actuator/health/liveness, port: 8080 }
+    restart: on-failure
+    env:
+      SPRING_R2DBC_URL: "r2dbc:postgresql://db:5432/dann"
+      SPRING_R2DBC_USERNAME: dann
+      SPRING_R2DBC_PASSWORD: dann
+
+proxy:
+  listen: 8088
+  routes:
+    console.localhost: dann-console:8080
+    access.localhost: dann-access:8080

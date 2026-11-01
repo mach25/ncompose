@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# ncompose runtime state and logs (next to every compose file)
+.ncompose/
+
+# Local service data, e.g. the examples' PostgreSQL clusters
+.data/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Local environment files
+.env
+.env.*

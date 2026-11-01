@@ -1,0 +1,14 @@
+[package]
+name = "echo-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Native HTTP + WebSocket echo server, log-compatible with jmalloc/echo-server"
+
+[dependencies]
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util"] }
+tokio-tungstenite = "0.24"

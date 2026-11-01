@@ -1,0 +1,33 @@
+# Shared infrastructure for dann-native-tests on ncompose (-Dstack.runtime=ncompose):
+# one native PostgreSQL; every test class creates (and drops) its own database on it.
+#
+# Address plan inside the 127.10.0.0/26 alias pool (`ncompose system install`):
+#   127.10.0.0/29    examples/dann
+#   127.10.0.8/29 .. 127.10.0.48/29   one slot per concurrently running test class (6 slots)
+#   127.10.0.56/29   this project (db = 127.10.0.58)
+#
+# One-time:  ../dann/setup-db.sh .data/pg     then:  ncompose up -d --wait
+name: dann-native-tests-infra
+
+networks:
+  infra: { subnet: 127.10.0.56/29 }
+
+services:
+  db:
+    binary: postgres
+    args:
+      - -D
+      - .data/pg
+      # Throwaway test data: trade durability for speed, and leave room for
+      # 4-6 concurrent stacks' connection pools.
+      - -c
+      - max_connections=500
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+    networks: [infra]
+    ip: 127.10.0.58
+    stop_timeout: 20
