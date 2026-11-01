@@ -43,13 +43,13 @@ enum Cmd {
         /// Seconds `--wait` waits
         #[arg(long, default_value_t = 120, requires = "wait")]
         timeout: u64,
-        /// Remove aliases this run had to create (with sudo) on exit
+        /// Remove aliases this run had to create (with sudo) when the project stops
         #[arg(long)]
         remove_aliases: bool,
     },
     /// Stop everything started by `up`
     Down {
-        /// Also remove aliases `up` had to create with sudo
+        /// Also remove aliases `up` had to create with sudo (always done after `up --remove-aliases`)
         #[arg(long)]
         remove_aliases: bool,
     },
@@ -83,6 +83,8 @@ enum Cmd {
     Supervise {
         #[arg(long, value_delimiter = ',')]
         aliases_added: Vec<Ipv4Addr>,
+        #[arg(long)]
+        remove_aliases: bool,
     },
 }
 
@@ -132,9 +134,9 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Config => cmd_config(&plan),
         Cmd::Up { detach, wait, timeout, remove_aliases } => {
             let wait = wait.then(|| Duration::from_secs(timeout));
-            cmd_up(plan, paths, &file, detach, wait, !remove_aliases)
+            cmd_up(plan, paths, &file, detach, wait, remove_aliases)
         }
-        Cmd::Down { remove_aliases } => cmd_down(&paths, !remove_aliases),
+        Cmd::Down { remove_aliases } => cmd_down(&paths, remove_aliases),
         Cmd::System { .. } => unreachable!(),
         Cmd::Ps => cmd_ps(&plan, &paths),
         Cmd::Logs { follow, tail, services } => cmd_logs(&plan, &paths, follow, tail, services),
@@ -153,9 +155,10 @@ fn run(cli: Cli) -> Result<()> {
             }
             net::remove_aliases(&plan.all_ips())
         }
-        Cmd::Supervise { aliases_added } => {
+        Cmd::Supervise { aliases_added, remove_aliases } => {
             let shim = net::shim_path()?;
-            tokio_rt()?.block_on(supervisor::run(plan, paths, shim, true, aliases_added))
+            let aliases = supervisor::Aliases { added: aliases_added, remove: remove_aliases };
+            tokio_rt()?.block_on(supervisor::run(plan, paths, shim, true, aliases))
         }
     }
 }
@@ -201,7 +204,7 @@ fn fmt_ips(ips: &[Ipv4Addr]) -> String {
 
 /// Returns the state if a supervisor for this project is alive.
 fn running_supervisor(paths: &Paths) -> Result<Option<State>> {
-    Ok(State::load(paths)?.filter(|s| pid_alive(s.supervisor_pid)))
+    Ok(State::load(paths)?.filter(State::supervisor_alive))
 }
 
 fn cmd_config(plan: &config::Plan) -> Result<()> {
@@ -238,11 +241,13 @@ fn cmd_config(plan: &config::Plan) -> Result<()> {
     Ok(())
 }
 
-/// Kill whatever a dead supervisor left behind.
+/// Kill whatever a dead supervisor left behind. Only processes that are provably
+/// ours are signalled: same PID *and* start time, and still leading their own
+/// process group (services are started as group leaders).
 fn cleanup_stale(paths: &Paths, st: &State) {
     for (name, s) in &st.services {
-        if let Some(pid) = s.pid {
-            if pid_alive(pid) {
+        if let Some(pid) = s.live_pid() {
+            if unsafe { libc::getpgid(pid) } == pid {
                 eprintln!("ncompose: killing leftover {name} (pid {pid})");
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
@@ -251,19 +256,30 @@ fn cleanup_stale(paths: &Paths, st: &State) {
     State::remove(paths);
 }
 
+/// Remove the aliases a stopped project created, if they are to be removed.
+fn release_aliases(st: &State, requested: bool) -> Result<()> {
+    if (requested || st.remove_aliases) && !st.aliases_added.is_empty() {
+        net::remove_aliases(&st.aliases_added)?;
+    }
+    Ok(())
+}
+
 fn cmd_up(
     plan: config::Plan,
     paths: Paths,
     file: &Path,
     detach: bool,
     wait: Option<Duration>,
-    keep_aliases: bool,
+    remove_aliases: bool,
 ) -> Result<()> {
     if let Some(st) = State::load(&paths)? {
-        if pid_alive(st.supervisor_pid) {
+        if st.supervisor_alive() {
             bail!("project {} is already running (supervisor pid {}); use `ncompose down`", st.project, st.supervisor_pid);
         }
         cleanup_stale(&paths, &st);
+        if let Err(e) = release_aliases(&st, false) {
+            eprintln!("ncompose: could not remove the previous run's aliases: {e:#}");
+        }
     }
     let shim = net::shim_path()?;
     for s in &plan.services {
@@ -272,8 +288,7 @@ fn cmd_up(
         }
     }
 
-    let added = net::ensure_aliases(&plan.all_ips())?;
-    let recorded = if keep_aliases { vec![] } else { added };
+    let aliases = supervisor::Aliases { added: net::ensure_aliases(&plan.all_ips())?, remove: remove_aliases };
 
     if detach {
         std::fs::create_dir_all(&paths.root)?;
@@ -284,8 +299,11 @@ fn cmd_up(
         let exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("-f").arg(std::fs::canonicalize(file)?).arg("__supervise");
-        if !recorded.is_empty() {
-            cmd.arg("--aliases-added").arg(recorded.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        if !aliases.added.is_empty() {
+            cmd.arg("--aliases-added").arg(aliases.added.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        }
+        if aliases.remove {
+            cmd.arg("--remove-aliases");
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)
@@ -305,7 +323,7 @@ fn cmd_up(
         let deadline = Instant::now() + wait.unwrap_or(Duration::from_secs(5));
         loop {
             if let Ok(Some(_)) = child.try_wait() {
-                let tail = std::fs::read_to_string(paths.supervisor_log()).unwrap_or_default();
+                let tail = read_lossy(&paths.supervisor_log());
                 bail!("supervisor exited during startup:\n{}", last_lines(&tail, 15));
             }
             if let Ok(Some(st)) = State::load(&paths) {
@@ -316,7 +334,7 @@ fn cmd_up(
                             .iter()
                             .find(|(_, s)| s.status.starts_with("exited") || s.status.starts_with("failed"))
                         {
-                            let log = std::fs::read_to_string(paths.log(name)).unwrap_or_default();
+                            let log = read_lossy(&paths.log(name));
                             bail!("{name} {} before it was ready; last log lines:\n{}", s.status, last_lines(&log, 30));
                         }
                         let ready = |s: &state::ServiceState| s.status == "healthy" || s.status == "running";
@@ -348,32 +366,33 @@ fn cmd_up(
         return Ok(());
     }
 
-    let res = tokio_rt()?.block_on(supervisor::run(plan, paths.clone(), shim, false, recorded.clone()));
+    let (added, remove) = (aliases.added.clone(), aliases.remove);
+    let res = tokio_rt()?.block_on(supervisor::run(plan, paths.clone(), shim, false, aliases));
     State::remove(&paths);
-    if !recorded.is_empty() {
-        if let Err(e) = net::remove_aliases(&recorded) {
+    if remove && !added.is_empty() {
+        if let Err(e) = net::remove_aliases(&added) {
             eprintln!("ncompose: could not remove aliases: {e:#}");
         }
     }
     res
 }
 
-fn cmd_down(paths: &Paths, keep_aliases: bool) -> Result<()> {
+fn cmd_down(paths: &Paths, remove_aliases: bool) -> Result<()> {
     let Some(st) = State::load(paths)? else {
         println!("nothing running");
         return Ok(());
     };
     let pid = st.supervisor_pid;
     let mut supervisor_cleans_aliases = false;
-    if pid_alive(pid) {
+    if st.supervisor_alive() {
         println!("stopping {} (supervisor pid {pid})...", st.project);
         unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(30);
         while pid_alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
-            // A foreground `up` removes its own state file and aliases when done.
+            // A foreground `up` removes its own state file (and, with --remove-aliases, its aliases).
             if !st.detached && !paths.state().exists() {
-                supervisor_cleans_aliases = true;
+                supervisor_cleans_aliases = st.remove_aliases;
                 break;
             }
         }
@@ -382,14 +401,14 @@ fn cmd_down(paths: &Paths, keep_aliases: bool) -> Result<()> {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         if !st.detached {
-            supervisor_cleans_aliases = true;
+            supervisor_cleans_aliases = st.remove_aliases;
         }
     }
     // Anything still alive (supervisor crashed or was killed)?
     let st_now = State::load(paths)?.unwrap_or(st.clone());
     cleanup_stale(paths, &st_now);
-    if !keep_aliases && !supervisor_cleans_aliases && !st.aliases_added.is_empty() {
-        net::remove_aliases(&st.aliases_added)?;
+    if !supervisor_cleans_aliases {
+        release_aliases(&st, remove_aliases)?;
     }
     println!("stopped");
     Ok(())
@@ -397,13 +416,13 @@ fn cmd_down(paths: &Paths, keep_aliases: bool) -> Result<()> {
 
 fn cmd_ps(plan: &config::Plan, paths: &Paths) -> Result<()> {
     let st = State::load(paths)?;
-    let running = st.as_ref().is_some_and(|s| pid_alive(s.supervisor_pid));
+    let running = st.as_ref().is_some_and(State::supervisor_alive);
     println!("{:<14} {:<12} {:>7} {:<22} {:>8}  PORTS", "SERVICE", "IP", "PID", "STATUS", "RESTARTS");
     for s in &plan.services {
         let ss = st.as_ref().filter(|_| running).and_then(|st| st.services.get(&s.name));
         let (pid, status, restarts) = match ss {
             Some(ss) => {
-                let pid = ss.pid.filter(|p| pid_alive(*p));
+                let pid = ss.live_pid();
                 (pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()), ss.status.clone(), ss.restarts)
             }
             None => ("-".into(), "not running".into(), 0),
@@ -417,6 +436,11 @@ fn cmd_ps(plan: &config::Plan, paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A log file as text, whatever bytes it holds.
+fn read_lossy(path: &Path) -> String {
+    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
 
 fn last_lines(s: &str, n: usize) -> String {
@@ -440,7 +464,9 @@ fn cmd_logs(plan: &config::Plan, paths: &Paths, follow: bool, tail: Option<usize
 
     let mut offsets = Vec::new();
     for n in &names {
-        let text = std::fs::read_to_string(paths.log(n)).unwrap_or_default();
+        // Services write whatever bytes they like; show invalid UTF-8 as U+FFFD.
+        let bytes = std::fs::read(paths.log(n)).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
         let shown = match tail {
             Some(t) => last_lines(&text, t),
             None => text.trim_end_matches('\n').to_string(),
@@ -449,7 +475,7 @@ fn cmd_logs(plan: &config::Plan, paths: &Paths, follow: bool, tail: Option<usize
         for l in shown.lines() {
             println!("{p}{l}");
         }
-        offsets.push(text.len() as u64);
+        offsets.push(bytes.len() as u64);
     }
     if !follow {
         return Ok(());
@@ -491,11 +517,7 @@ fn cmd_restart(plan: &config::Plan, paths: &Paths, services: Vec<String>) -> Res
         }
     }
     let req = if services.is_empty() { "*".to_string() } else { services.join(" ") };
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.restart_requests())?;
-    writeln!(f, "{req}")?;
+    state::append_restart_request(paths, &req)?;
     unsafe { libc::kill(st.supervisor_pid, libc::SIGUSR1) };
     println!("restart requested: {}", if services.is_empty() { "all services".into() } else { services.join(", ") });
     Ok(())

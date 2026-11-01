@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -68,9 +68,33 @@ pub fn upstream_nameservers() -> Vec<SocketAddr> {
 fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
     text.lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .filter_map(|ip| ip.trim().split('%').next()?.parse().ok())
-        .map(|ip| SocketAddr::new(ip, 53))
+        .filter_map(|ns| parse_nameserver(ns.trim()))
         .collect()
+}
+
+/// `192.168.1.1`, `2001:db8::1`, or a link-local `fe80::1%en0` / `fe80::1%4`, whose
+/// scope (the interface) is needed to reach it at all.
+fn parse_nameserver(ns: &str) -> Option<SocketAddr> {
+    let (ip, scope) = match ns.split_once('%') {
+        Some((ip, scope)) => (ip, Some(scope)),
+        None => (ns, None),
+    };
+    match ip.parse::<IpAddr>().ok()? {
+        IpAddr::V4(v4) => Some(SocketAddr::new(v4.into(), 53)),
+        IpAddr::V6(v6) => {
+            let scope_id = match scope {
+                None => 0,
+                Some(s) => s.parse().ok().or_else(|| interface_index(s))?,
+            };
+            Some(SocketAddr::V6(SocketAddrV6::new(v6, 53, 0, scope_id)))
+        }
+    }
+}
+
+fn interface_index(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    (idx != 0).then_some(idx)
 }
 
 async fn forward(query: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
@@ -217,9 +241,14 @@ mod tests {
 
     #[test]
     fn resolv_conf_nameservers() {
-        let text = "# generated\nsearch example.org\nnameserver 192.168.1.1\nnameserver fe80::1%en0\n  nameserver   9.9.9.9  \nnameserver bogus\n";
+        let text = "# generated\nsearch example.org\nnameserver 192.168.1.1\nnameserver fe80::1%lo0\n  nameserver   9.9.9.9  \nnameserver bogus\nnameserver 2001:db8::1\nnameserver fe80::2%7\nnameserver fe80::3%nosuchif0\n";
         let servers: Vec<String> = parse_resolv_conf(text).iter().map(|s| s.to_string()).collect();
-        assert_eq!(servers, ["192.168.1.1:53", "[fe80::1]:53", "9.9.9.9:53"]);
+        let lo0 = interface_index("lo0").unwrap();
+        assert_eq!(
+            servers,
+            ["192.168.1.1:53".to_string(), format!("[fe80::1%{lo0}]:53"), "9.9.9.9:53".into(), "[2001:db8::1]:53".into(), "[fe80::2%7]:53".into()],
+            "link-local nameservers keep their interface; an unknown interface is skipped"
+        );
     }
 
     #[tokio::test]

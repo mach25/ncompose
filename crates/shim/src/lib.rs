@@ -25,7 +25,9 @@
 //! - DNS (with `NCOMPOSE_DNS`): UDP datagrams to port 53 of a non-service address go to
 //!   the supervisor's resolver at `NCOMPOSE_IP:NCOMPOSE_DNS` instead, like Docker's embedded DNS,
 //!   for resolvers that bypass `getaddrinfo` (Netty, c-ares, ...). `recvfrom` /
-//!   `recvmsg` report the answer as coming from the nameserver that was asked.
+//!   `recvmsg` report the answer as coming from the nameserver that was asked (matched by
+//!   DNS transaction ID, so one socket may query several).
+//! - `close`: forgets the descriptor's DNS bookkeeping, as its number gets reused.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -38,6 +40,7 @@ use std::ffi::{CStr, CString};
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -71,9 +74,15 @@ interpose!(I_RECVFROM: libc::recvfrom => nc_recvfrom);
 interpose!(I_RECVMSG: libc::recvmsg => nc_recvmsg);
 interpose!(I_GETADDRINFO: libc::getaddrinfo => nc_getaddrinfo);
 interpose!(I_GETHOSTBYNAME: gethostbyname => nc_gethostbyname);
+interpose!(I_CLOSE: real_close => nc_close);
+interpose!(I_CLOSE_NOCANCEL: real_close_nocancel => nc_close_nocancel);
 
 extern "C" {
     fn gethostbyname(name: *const c_char) -> *mut hostent;
+    #[link_name = "close"]
+    fn real_close(fd: c_int) -> c_int;
+    #[link_name = "close$NOCANCEL"]
+    fn real_close_nocancel(fd: c_int) -> c_int;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +130,19 @@ fn parse_hosts(s: &str) -> Vec<(String, Ipv4Addr)> {
         .collect()
 }
 
-fn debug(msg: std::fmt::Arguments) {
-    if config().debug {
-        let s = format!("[ncompose-shim pid={}] {}\n", std::process::id(), msg);
-        unsafe { libc::write(2, s.as_ptr() as *const c_void, s.len()) };
-    }
+/// Log to stderr when `NCOMPOSE_DEBUG` is set. The arguments are only evaluated
+/// then: these calls sit on every interposed bind and connect.
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if config().debug {
+            write_debug(format_args!($($arg)*));
+        }
+    };
+}
+
+fn write_debug(msg: std::fmt::Arguments) {
+    let s = format!("[ncompose-shim pid={}] {}\n", std::process::id(), msg);
+    unsafe { libc::write(2, s.as_ptr() as *const c_void, s.len()) };
 }
 
 fn lookup(name: &str) -> Option<Ipv4Addr> {
@@ -327,7 +344,7 @@ unsafe fn bind_source_if_unbound(fd: c_int, dest: &Addr, own: Ipv4Addr) {
         _ => return,
     };
     if libc::bind(fd, src.ptr(), src.len()) == 0 {
-        debug(format_args!("fd {fd}: source bound to {}", fmt_addr(&src)));
+        debug!("fd {fd}: source bound to {}", fmt_addr(&src));
     }
 }
 
@@ -359,9 +376,87 @@ unsafe fn is_wildcard(addr: *const sockaddr, len: socklen_t) -> bool {
 
 const DNS_PORT: u16 = 53;
 
-/// fd -> the nameserver address the app sent its query to (raw sockaddr bytes).
-type AskedNameservers = HashMap<c_int, (Vec<u8>, socklen_t)>;
-static DNS_ASKED: Mutex<Option<AskedNameservers>> = Mutex::new(None);
+/// A nameserver address as the app gave it (raw sockaddr bytes).
+type RawAddr = Vec<u8>;
+
+/// Remembered queries per socket: which nameserver each DNS transaction ID was sent
+/// to, so a reply is reported as coming from the nameserver that query asked, even
+/// when one socket queries several (Netty retries and rotates on one channel).
+#[derive(Default)]
+struct Asked {
+    /// (transaction ID, nameserver), oldest first; bounded.
+    by_id: std::collections::VecDeque<(u16, RawAddr)>,
+    /// The nameserver of the latest query, for replies whose ID we never saw
+    /// (connected sockets send with `send`, which is not interposed).
+    last: RawAddr,
+}
+
+const ASKED_PER_FD: usize = 64;
+
+static DNS_ASKED: Mutex<Option<HashMap<c_int, Asked>>> = Mutex::new(None);
+/// Set once any query was redirected; until then `close` skips the lock.
+static DNS_USED: AtomicBool = AtomicBool::new(false);
+
+fn dns_asked() -> std::sync::MutexGuard<'static, Option<HashMap<c_int, Asked>>> {
+    DNS_ASKED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The transaction ID at the start of a DNS message.
+fn dns_id(msg: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes([*msg.first()?, *msg.get(1)?]))
+}
+
+/// The first two bytes of a scatter/gather buffer, limited to `total` bytes.
+unsafe fn iov_id(iov: *const libc::iovec, iovlen: c_int, mut total: usize) -> Option<u16> {
+    if iov.is_null() {
+        return None;
+    }
+    let mut head = [0u8; 2];
+    let mut have = 0;
+    for i in 0..iovlen.max(0) as usize {
+        let v = &*iov.add(i);
+        let n = v.iov_len.min(total).min(2 - have);
+        if n > 0 && !v.iov_base.is_null() {
+            std::ptr::copy_nonoverlapping(v.iov_base as *const u8, head.as_mut_ptr().add(have), n);
+        }
+        have += n;
+        total -= n.min(total);
+        if have == 2 {
+            return dns_id(&head);
+        }
+    }
+    None
+}
+
+fn remember_query(fd: c_int, id: Option<u16>, raw: RawAddr) {
+    DNS_USED.store(true, Ordering::Relaxed);
+    let mut guard = dns_asked();
+    let asked = guard.get_or_insert_with(HashMap::new).entry(fd).or_default();
+    if let Some(id) = id {
+        asked.by_id.retain(|(i, _)| *i != id);
+        if asked.by_id.len() == ASKED_PER_FD {
+            asked.by_id.pop_front();
+        }
+        asked.by_id.push_back((id, raw.clone()));
+    }
+    asked.last = raw;
+}
+
+/// The nameserver a reply on `fd` with transaction `id` answers.
+fn asked_nameserver(fd: c_int, id: Option<u16>) -> Option<RawAddr> {
+    let guard = dns_asked();
+    let asked = guard.as_ref()?.get(&fd)?;
+    id.and_then(|id| asked.by_id.iter().find(|(i, _)| *i == id).map(|(_, a)| a.clone()))
+        .or_else(|| (!asked.last.is_empty()).then(|| asked.last.clone()))
+}
+
+fn forget_fd(fd: c_int) {
+    if DNS_USED.load(Ordering::Relaxed) {
+        if let Some(m) = dns_asked().as_mut() {
+            m.remove(&fd);
+        }
+    }
+}
 
 unsafe fn is_datagram(fd: c_int) -> bool {
     let mut t: c_int = 0;
@@ -372,7 +467,14 @@ unsafe fn is_datagram(fd: c_int) -> bool {
 
 /// A DNS query to an outside nameserver goes to our supervisor's resolver instead.
 /// Service addresses (127/8 other than 127.0.0.1) are left alone: a service may run DNS.
-unsafe fn dns_redirect(fd: c_int, addr: *const sockaddr, len: socklen_t, own: Ipv4Addr) -> Option<Addr> {
+/// `id` is the query's DNS transaction ID, when the datagram is at hand.
+unsafe fn dns_redirect(
+    fd: c_int,
+    addr: *const sockaddr,
+    len: socklen_t,
+    own: Ipv4Addr,
+    id: Option<u16>,
+) -> Option<Addr> {
     let dns_port = config().dns?;
     if port_of(addr, len)? != DNS_PORT || !is_datagram(fd) {
         return None;
@@ -400,14 +502,14 @@ unsafe fn dns_redirect(fd: c_int, addr: *const sockaddr, len: socklen_t, own: Ip
         }
         _ => return None,
     };
-    let raw = std::slice::from_raw_parts(addr as *const u8, len as usize).to_vec();
-    DNS_ASKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(fd, (raw, len));
-    debug(format_args!("dns fd {fd}: {} -> {}", fmt_raw(addr, len), fmt_addr(&new)));
+    remember_query(fd, id, std::slice::from_raw_parts(addr as *const u8, len as usize).to_vec());
+    debug!("dns fd {fd}: {} -> {}", fmt_raw(addr, len), fmt_addr(&new));
     Some(new)
 }
 
-/// If a datagram on `fd` came from our resolver, report the nameserver that was asked.
-unsafe fn dns_unredirect(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) {
+/// If a datagram on `fd` came from our resolver, report the nameserver that was asked
+/// (by the query with the reply's transaction ID `id`).
+unsafe fn dns_unredirect(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t, id: Option<u16>) {
     let Some(own) = config().ip else { return };
     let Some(dns_port) = config().dns else { return };
     if addr.is_null() || len.is_null() || port_of(addr, *len) != Some(dns_port) {
@@ -421,11 +523,10 @@ unsafe fn dns_unredirect(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) {
     if !from_us {
         return;
     }
-    let guard = DNS_ASKED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((raw, rawlen)) = guard.as_ref().and_then(|m| m.get(&fd)) {
-        if *len >= *rawlen {
-            std::ptr::copy_nonoverlapping(raw.as_ptr(), addr as *mut u8, *rawlen as usize);
-            *len = *rawlen;
+    if let Some(raw) = asked_nameserver(fd, id) {
+        if *len as usize >= raw.len() {
+            std::ptr::copy_nonoverlapping(raw.as_ptr(), addr as *mut u8, raw.len());
+            *len = raw.len() as socklen_t;
         }
     }
 }
@@ -445,7 +546,7 @@ pub unsafe extern "C" fn nc_bind(fd: c_int, addr: *const sockaddr, len: socklen_
     if family(addr, len) == Some(AF_INET6) && len as usize >= size_of::<sockaddr_in6>() {
         let a = &*(addr as *const sockaddr_in6);
         if v6_as_v4(&a.sin6_addr).is_some_and(is_wild_or_loopback) && is_v6only(fd) {
-            debug(format_args!("bind fd {fd}: {} refused (v6-only socket)", fmt_raw(addr, len)));
+            debug!("bind fd {fd}: {} refused (v6-only socket)", fmt_raw(addr, len));
             *libc::__error() = libc::EADDRNOTAVAIL;
             return -1;
         }
@@ -468,11 +569,11 @@ pub unsafe extern "C" fn nc_bind(fd: c_int, addr: *const sockaddr, len: socklen_
                 size_of::<c_int>() as socklen_t,
             );
             let r = libc::bind(fd, new.ptr(), new.len());
-            debug(format_args!(
+            debug!(
                 "bind fd {fd}: {} -> {} = {r}",
                 fmt_raw(addr, len),
                 fmt_addr(&new)
-            ));
+            );
             r
         }
         None => libc::bind(fd, addr, len),
@@ -484,16 +585,16 @@ pub unsafe extern "C" fn nc_connect(fd: c_int, addr: *const sockaddr, len: sockl
     let Some(own) = config().ip else {
         return libc::connect(fd, addr, len);
     };
-    if let Some(dns) = dns_redirect(fd, addr, len, own) {
+    if let Some(dns) = dns_redirect(fd, addr, len, own, None) {
         return libc::connect(fd, dns.ptr(), dns.len());
     }
     let new = rewrite(fd, addr, len, is_loopback, own);
     if let Some(n) = &new {
-        debug(format_args!(
+        debug!(
             "connect fd {fd}: {} -> {}",
             fmt_raw(addr, len),
             fmt_addr(n)
-        ));
+        );
     }
     // Copy the (possibly rewritten) destination so we can inspect it.
     let dest = match &new {
@@ -530,7 +631,8 @@ pub unsafe extern "C" fn nc_sendto(
     len: socklen_t,
 ) -> ssize_t {
     if let Some(own) = config().ip {
-        if let Some(new) = dns_redirect(fd, addr, len, own).or_else(|| rewrite(fd, addr, len, is_loopback, own)) {
+        let id = if buf.is_null() { None } else { dns_id(std::slice::from_raw_parts(buf as *const u8, n.min(2))) };
+        if let Some(new) = dns_redirect(fd, addr, len, own, id).or_else(|| rewrite(fd, addr, len, is_loopback, own)) {
             return libc::sendto(fd, buf, n, flags, new.ptr(), new.len());
         }
     }
@@ -542,8 +644,9 @@ pub unsafe extern "C" fn nc_sendmsg(fd: c_int, msg: *const msghdr, flags: c_int)
     if let (Some(own), false) = (config().ip, msg.is_null()) {
         let m = &*msg;
         let (name, namelen) = (m.msg_name as *const sockaddr, m.msg_namelen);
+        let id = iov_id(m.msg_iov, m.msg_iovlen, usize::MAX);
         if let Some(new) =
-            dns_redirect(fd, name, namelen, own).or_else(|| rewrite(fd, name, namelen, is_loopback, own))
+            dns_redirect(fd, name, namelen, own, id).or_else(|| rewrite(fd, name, namelen, is_loopback, own))
         {
             let mut copy = *m;
             copy.msg_name = new.ptr() as *mut c_void;
@@ -565,7 +668,8 @@ pub unsafe extern "C" fn nc_recvfrom(
 ) -> ssize_t {
     let r = libc::recvfrom(fd, buf, n, flags, addr, len);
     if r >= 0 {
-        dns_unredirect(fd, addr, len);
+        let id = if buf.is_null() { None } else { dns_id(std::slice::from_raw_parts(buf as *const u8, (r as usize).min(n).min(2))) };
+        dns_unredirect(fd, addr, len, id);
     }
     r
 }
@@ -575,9 +679,23 @@ pub unsafe extern "C" fn nc_recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -
     let r = libc::recvmsg(fd, msg, flags);
     if r >= 0 && !msg.is_null() {
         let m = &mut *msg;
-        dns_unredirect(fd, m.msg_name as *mut sockaddr, &mut m.msg_namelen);
+        let id = iov_id(m.msg_iov, m.msg_iovlen, r as usize);
+        dns_unredirect(fd, m.msg_name as *mut sockaddr, &mut m.msg_namelen, id);
     }
     r
+}
+
+/// A closed descriptor's number is reused by the next socket; drop what we remembered.
+#[no_mangle]
+pub unsafe extern "C" fn nc_close(fd: c_int) -> c_int {
+    forget_fd(fd);
+    real_close(fd)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nc_close_nocancel(fd: c_int) -> c_int {
+    forget_fd(fd);
+    real_close_nocancel(fd)
 }
 
 #[no_mangle]
@@ -628,7 +746,7 @@ pub unsafe extern "C" fn nc_getaddrinfo(
                 // CString::new cannot fail: an IP string has no NULs.
                 let ip_c = CString::new(ip.to_string()).unwrap_or_default();
                 let r = libc::getaddrinfo(ip_c.as_ptr(), service, &h, res);
-                debug(format_args!("getaddrinfo {name} -> {ip} = {r}"));
+                debug!("getaddrinfo {name} -> {ip} = {r}");
                 return r;
             }
         }
@@ -653,7 +771,7 @@ pub unsafe extern "C" fn nc_gethostbyname(name: *const c_char) -> *mut hostent {
     if !name.is_null() {
         if let Ok(n) = CStr::from_ptr(name).to_str() {
             if let Some(ip) = lookup(n) {
-                debug(format_args!("gethostbyname {n} -> {ip}"));
+                debug!("gethostbyname {n} -> {ip}");
                 return HOSTENT.with(|cell| {
                     let mut slot = cell.borrow_mut();
                     let mut b = Box::new(HostentBuf {
@@ -715,6 +833,40 @@ mod tests {
     }
 
     const OWN: Ipv4Addr = Ipv4Addr::new(127, 10, 0, 2);
+
+    #[test]
+    fn dns_ids_are_read_across_buffers() {
+        assert_eq!(dns_id(&[0x12, 0x34, 0]), Some(0x1234));
+        assert_eq!(dns_id(&[0x12]), None);
+        let (a, b) = ([0x12u8], [0x34u8, 0x56]);
+        let iov = [
+            libc::iovec { iov_base: a.as_ptr() as *mut c_void, iov_len: 1 },
+            libc::iovec { iov_base: b.as_ptr() as *mut c_void, iov_len: 2 },
+        ];
+        unsafe {
+            assert_eq!(iov_id(iov.as_ptr(), 2, usize::MAX), Some(0x1234));
+            assert_eq!(iov_id(iov.as_ptr(), 2, 1), None, "only one byte was received");
+            assert_eq!(iov_id(iov.as_ptr(), 1, usize::MAX), None);
+            assert_eq!(iov_id(std::ptr::null(), 2, usize::MAX), None);
+        }
+    }
+
+    #[test]
+    fn nameservers_are_remembered_per_query_and_forgotten_on_close() {
+        let fd = -42; // never a real descriptor
+        remember_query(fd, Some(1), vec![1]);
+        remember_query(fd, Some(2), vec![2]);
+        assert_eq!(asked_nameserver(fd, Some(1)), Some(vec![1]));
+        assert_eq!(asked_nameserver(fd, Some(2)), Some(vec![2]));
+        assert_eq!(asked_nameserver(fd, Some(9)), Some(vec![2]), "unknown ids: the latest");
+        assert_eq!(asked_nameserver(fd, None), Some(vec![2]));
+        for id in 0..ASKED_PER_FD as u16 + 10 {
+            remember_query(fd, Some(100 + id), vec![3]);
+        }
+        assert_eq!(dns_asked().as_ref().unwrap()[&fd].by_id.len(), ASKED_PER_FD, "bounded");
+        forget_fd(fd);
+        assert_eq!(asked_nameserver(fd, Some(1)), None);
+    }
 
     #[test]
     fn hosts_table_parsing() {

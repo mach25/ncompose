@@ -90,6 +90,40 @@ fn child() {
                 Err(e) => result("answer", format!("error:{e}")),
             }
         }
+        "dns-two" => {
+            // One socket, two nameservers (Netty rotates and retries on one channel).
+            let s = UdpSocket::bind(arg("NC_UDP_BIND")).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            s.send_to(&[0, 1, b'q'], arg("NC_NAMESERVER")).unwrap();
+            s.send_to(&[0, 2, b'q'], arg("NC_NAMESERVER2")).unwrap();
+            let mut buf = [0u8; 64];
+            for _ in 0..2 {
+                match s.recv_from(&mut buf) {
+                    Ok((n, from)) if n >= 2 => result(&format!("from{}", buf[1]), from.to_string()),
+                    Ok(_) => result("answer", "short".into()),
+                    Err(e) => result("answer", format!("error:{e}")),
+                }
+            }
+        }
+        "dns-reuse" => {
+            // A socket that asked a nameserver is closed; the next socket, which gets the same
+            // descriptor, talks to the resolver's address directly and must see it unchanged.
+            let first = UdpSocket::bind(arg("NC_UDP_BIND")).unwrap();
+            first.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            first.send_to(&[0, 1, b'q'], arg("NC_NAMESERVER")).unwrap();
+            let mut buf = [0u8; 64];
+            first.recv_from(&mut buf).unwrap();
+            let fd1 = std::os::fd::AsRawFd::as_raw_fd(&first);
+            drop(first);
+            let second = UdpSocket::bind(arg("NC_UDP_BIND")).unwrap();
+            second.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            result("same_fd", (std::os::fd::AsRawFd::as_raw_fd(&second) == fd1).to_string());
+            second.send_to(&[0, 1, b'd'], arg("NC_DIRECT")).unwrap();
+            match second.recv_from(&mut buf) {
+                Ok((_, from)) => result("from", from.to_string()),
+                Err(e) => result("from", format!("error:{e}")),
+            }
+        }
         "dns-connected" => {
             // Resolvers that connect() their UDP socket and then use send/recv.
             let s = UdpSocket::bind(arg("NC_UDP_BIND")).unwrap();
@@ -278,6 +312,71 @@ fn dns_datagrams_go_to_the_embedded_resolver_and_answer_as_the_nameserver() {
         assert_eq!(r["answer"], "answer", "{bind}");
         assert_eq!(r["from"], nameserver, "the reply must look like it came from the nameserver asked");
     }
+    serve.join().unwrap();
+}
+
+/// A resolver on 127.0.0.1 that echoes every datagram back, `n` times.
+fn echo_resolver(n: usize) -> (u16, std::thread::JoinHandle<()>) {
+    let resolver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    resolver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let port = resolver.local_addr().unwrap().port();
+    let serve = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        let mut got = Vec::new();
+        for _ in 0..n {
+            let (len, from) = resolver.recv_from(&mut buf).unwrap();
+            got.push((buf[..len].to_vec(), from));
+        }
+        // Answer in reverse order, so replies do not simply follow the latest query.
+        for (msg, from) in got.into_iter().rev() {
+            resolver.send_to(&msg, from).unwrap();
+        }
+    });
+    (port, serve)
+}
+
+#[test]
+fn dns_replies_come_from_the_nameserver_their_query_asked() {
+    let (port, serve) = echo_resolver(2);
+    let r = run(
+        "dns-two",
+        Some(LOCALHOST),
+        &[
+            ("NCOMPOSE_DNS", port.to_string()),
+            ("NC_UDP_BIND", "0.0.0.0:0".into()),
+            ("NC_NAMESERVER", "192.0.2.53:53".into()),
+            ("NC_NAMESERVER2", "198.51.100.53:53".into()),
+        ],
+    );
+    assert_eq!(r["from1"], "192.0.2.53:53");
+    assert_eq!(r["from2"], "198.51.100.53:53");
+    serve.join().unwrap();
+}
+
+#[test]
+fn a_reused_descriptor_does_not_inherit_a_closed_sockets_nameserver() {
+    let resolver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    resolver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let port = resolver.local_addr().unwrap().port();
+    let serve = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            let (n, from) = resolver.recv_from(&mut buf).unwrap();
+            resolver.send_to(&buf[..n], from).unwrap();
+        }
+    });
+    let r = run(
+        "dns-reuse",
+        Some(LOCALHOST),
+        &[
+            ("NCOMPOSE_DNS", port.to_string()),
+            ("NC_UDP_BIND", "0.0.0.0:0".into()),
+            ("NC_NAMESERVER", "192.0.2.53:53".into()),
+            ("NC_DIRECT", format!("127.0.0.1:{port}")),
+        ],
+    );
+    assert_eq!(r["same_fd"], "true", "the scenario relies on descriptor reuse");
+    assert_eq!(r["from"], format!("127.0.0.1:{port}"));
     serve.join().unwrap();
 }
 

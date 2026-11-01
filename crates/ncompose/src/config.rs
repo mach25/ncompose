@@ -304,10 +304,7 @@ fn plan(file: ComposeFile, dir: PathBuf) -> Result<Plan> {
             continue;
         }
         let (net, prefix) = networks[&primary_net(s)];
-        let base = u32::from(net);
-        let size = 1u32 << (32 - prefix);
-        let ip = (2..size - 1)
-            .map(|i| Ipv4Addr::from(base + i))
+        let ip = host_addrs(net, prefix)
             .find(|ip| !used.contains(ip))
             .ok_or_else(|| anyhow!("network {} is full", primary_net(s)))?;
         used.insert(ip);
@@ -370,13 +367,16 @@ fn plan(file: ComposeFile, dir: PathBuf) -> Result<Plan> {
         });
     }
 
-    // Host ports must be unique.
-    let mut seen = HashSet::new();
+    // Published addresses must not collide (the same port on different addresses is fine,
+    // but a wildcard address takes the port on every address).
+    let mut published: Vec<std::net::SocketAddrV4> = Vec::new();
     for s in &services {
         for p in &s.ports {
-            if !seen.insert(p.host_port) {
-                bail!("host port {} is published more than once", p.host_port);
+            let addr = std::net::SocketAddrV4::new(p.host_ip, p.host_port);
+            if let Some(other) = published.iter().find(|o| addrs_collide(o, &addr)) {
+                bail!("service {}: {addr} is already published ({other})", s.name);
             }
+            published.push(addr);
         }
     }
 
@@ -393,8 +393,8 @@ fn plan(file: ComposeFile, dir: PathBuf) -> Result<Plan> {
             };
             let listen: std::net::SocketAddrV4 =
                 listen.parse().with_context(|| format!("proxy.listen {listen:?}"))?;
-            if seen.contains(&listen.port()) {
-                bail!("proxy port {} is also published by a service", listen.port());
+            if let Some(other) = published.iter().find(|o| addrs_collide(o, &listen)) {
+                bail!("proxy {listen} collides with a published port ({other})");
             }
             let mut routes = Vec::new();
             for (host, target) in &p.routes {
@@ -415,6 +415,20 @@ fn plan(file: ComposeFile, dir: PathBuf) -> Result<Plan> {
     };
 
     Ok(Plan { project, dir, services, proxy })
+}
+
+/// Whether two listeners would fight over the same address and port.
+fn addrs_collide(a: &std::net::SocketAddrV4, b: &std::net::SocketAddrV4) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// The addresses of a subnet that services get: .2 up to the one before broadcast
+/// (.1 is left for the gateway role, as in Docker). The boot-time alias pool uses the
+/// same range, so every address `up` allocates inside it already exists.
+pub fn host_addrs(net: Ipv4Addr, prefix: u8) -> impl Iterator<Item = Ipv4Addr> {
+    let base = u32::from(net);
+    let size = 1u32 << (32 - u32::from(prefix));
+    (2..size.saturating_sub(1)).map(move |i| Ipv4Addr::from(base + i))
 }
 
 /// `~/x` -> `$HOME/x`
@@ -594,9 +608,39 @@ services: { a: { binary: a, networks: [n] }, b: { binary: b, networks: [n] } }
     #[test]
     fn host_ports_and_the_proxy_port_must_be_unique() {
         assert!(err(r#"services: { a: { binary: a, ports: ["80"] }, b: { binary: b, ports: ["8080:80", "80:81"] } }"#)
-            .contains("more than once"));
+            .contains("already published"));
         assert!(err("services: { a: { binary: a, ports: [\"80\"] } }\nproxy: { listen: 80 }")
-            .contains("also published"));
+            .contains("collides"));
+        // A wildcard address takes the port everywhere.
+        assert!(err(r#"services: { a: { binary: a, ports: ["0.0.0.0:80:80"] }, b: { binary: b, ports: ["127.0.0.2:80:80"] } }"#)
+            .contains("already published"));
+        assert!(err("services: { a: { binary: a, ports: [\"0.0.0.0:80:80\"] } }\nproxy: { listen: 80 }")
+            .contains("collides"));
+    }
+
+    #[test]
+    fn the_same_port_on_different_addresses_is_fine() {
+        let plan = p(r#"
+services:
+  a: { binary: a, ports: ["127.0.0.1:80:80"] }
+  b: { binary: b, ports: ["127.0.0.2:80:80"] }
+proxy: { listen: "127.0.0.3:80" }
+"#)
+        .unwrap();
+        assert_eq!(plan.services.len(), 2);
+        assert_eq!(plan.proxy.unwrap().listen_port, 80);
+    }
+
+    #[test]
+    fn allocation_and_the_alias_pool_use_the_same_addresses() {
+        let pool = crate::net::pool_addrs("127.10.0.0/29").unwrap();
+        assert_eq!(pool.first(), Some(&Ipv4Addr::new(127, 10, 0, 2)));
+        assert_eq!(pool.last(), Some(&Ipv4Addr::new(127, 10, 0, 6)));
+        let yaml = "networks: { n: { subnet: 127.10.0.0/29 } }\nservices:\n"
+            .to_string()
+            + &(0..pool.len()).map(|i| format!("  s{i}: {{ binary: x, networks: [n] }}\n")).collect::<String>();
+        let ips: Vec<Ipv4Addr> = p(&yaml).unwrap().services.iter().map(|s| s.ip).collect();
+        assert_eq!(ips, pool);
     }
 
     #[test]

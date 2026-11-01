@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
 
 const COLORS: [&str; 6] = ["36", "33", "32", "35", "34", "31"];
 
@@ -80,7 +80,21 @@ impl Shared {
     }
 }
 
-pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliases_added: Vec<Ipv4Addr>) -> Result<()> {
+/// Loopback aliases `up` created for this run.
+pub struct Aliases {
+    pub added: Vec<Ipv4Addr>,
+    /// Remove them when the project stops (`up --remove-aliases`).
+    pub remove: bool,
+}
+
+/// Restart requests for one service: a generation counter. A service loop marks the
+/// current generation seen when it starts the service, so only requests made while
+/// the service runs (or after it exited) restart it; one made while it was still
+/// waiting for dependencies or being stopped is already satisfied by that start.
+type RestartTx = watch::Sender<u64>;
+type RestartRx = watch::Receiver<u64>;
+
+pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliases: Aliases) -> Result<()> {
     std::fs::create_dir_all(paths.logs())?;
     let _ = std::fs::remove_file(paths.restart_requests());
 
@@ -94,8 +108,10 @@ pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliase
     let mut state = State {
         project: plan.project.clone(),
         supervisor_pid: std::process::id() as i32,
+        supervisor_start: crate::state::process_start(std::process::id() as i32),
         detached,
-        aliases_added,
+        aliases_added: aliases.added,
+        remove_aliases: aliases.remove,
         services: Default::default(),
     };
     for s in &plan.services {
@@ -167,12 +183,12 @@ pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliase
     }
 
     // Start services in dependency order.
-    let mut restart_signals: HashMap<String, Arc<Notify>> = HashMap::new();
+    let mut restart_signals: HashMap<String, RestartTx> = HashMap::new();
     let mut service_tasks = tokio::task::JoinSet::new();
     for (idx, svc) in plan.services.iter().enumerate() {
-        let notify = Arc::new(Notify::new());
-        restart_signals.insert(svc.name.clone(), notify.clone());
-        service_tasks.spawn(service_loop(shared.clone(), svc.clone(), idx, notify));
+        let (tx, rx) = watch::channel(0u64);
+        restart_signals.insert(svc.name.clone(), tx);
+        service_tasks.spawn(service_loop(shared.clone(), svc.clone(), idx, rx));
     }
 
     // Wait for a stop signal; SIGUSR1 = restart requests from `ncompose restart`.
@@ -186,12 +202,14 @@ pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliase
             _ = sigterm.recv() => break,
             _ = sighup.recv() => break,
             _ = sigusr1.recv() => {
-                let req = std::fs::read_to_string(paths.restart_requests()).unwrap_or_default();
-                let _ = std::fs::remove_file(paths.restart_requests());
-                let names: Vec<&str> = req.split_whitespace().collect();
-                for (name, n) in &restart_signals {
-                    if names.is_empty() || names.contains(&"*") || names.contains(&name.as_str()) {
-                        n.notify_one();
+                let names = match crate::state::take_restart_requests(&paths) {
+                    Ok(Some(names)) => names,
+                    Ok(None) => continue, // already taken with an earlier signal
+                    Err(e) => { out.info(&format!("cannot read restart requests: {e}")); continue }
+                };
+                for (name, tx) in &restart_signals {
+                    if names.is_empty() || names.contains(name) {
+                        tx.send_modify(|generation| *generation += 1);
                     }
                 }
             }
@@ -222,7 +240,7 @@ pub async fn run(plan: Plan, paths: Paths, shim: PathBuf, detached: bool, aliase
     Ok(())
 }
 
-async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, restart: Arc<Notify>) {
+async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, mut restart: RestartRx) {
     let mut shutdown = sh.shutdown.clone();
     if !wait_for_dependencies(&sh, &svc, &mut shutdown).await {
         sh.update(&svc.name, |s| s.status = "not started".into());
@@ -240,6 +258,8 @@ async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, restart: Arc<
         }
         first = false;
 
+        // Requests made before this start are satisfied by it.
+        restart.borrow_and_update();
         let started = Instant::now();
         let mut child = match spawn(&sh, &svc, color) {
             Ok(c) => c,
@@ -251,7 +271,7 @@ async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, restart: Arc<
                     s.last_exit = Some(format!("{e:#}"));
                 });
                 // Treat as a failure for restart purposes.
-                if !wait_for_restart(&sh, &svc, false, &mut backoff, &restart, &mut shutdown).await {
+                if !wait_for_restart(&sh, &svc, false, &mut backoff, &mut restart, &mut shutdown).await {
                     break;
                 }
                 continue;
@@ -265,9 +285,11 @@ async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, restart: Arc<
             svc.ip
         ));
         let has_check = svc.healthcheck.is_some();
+        let pid_start = pid.and_then(crate::state::process_start);
         sh.update(&svc.name, |s| {
             s.status = if has_check { "starting" } else { "running" }.into();
             s.pid = pid;
+            s.pid_start = pid_start;
         });
         if !has_check {
             ready.send_replace(true);
@@ -296,19 +318,20 @@ async fn service_loop(sh: Arc<Shared>, svc: Service, color: usize, restart: Arc<
                     sh.update(&svc.name, |s| {
                         s.status = format!("exited ({desc})");
                         s.pid = None;
+                        s.pid_start = None;
                         s.last_exit = Some(desc);
                     });
                     if started.elapsed() > Duration::from_secs(10) {
                         backoff = Duration::from_secs(1);
                     }
-                    break wait_for_restart(&sh, &svc, success, &mut backoff, &restart, &mut shutdown).await;
+                    break wait_for_restart(&sh, &svc, success, &mut backoff, &mut restart, &mut shutdown).await;
                 }
                 _ = shutdown.changed() => {
                     ready.send_replace(false);
                     stop_child(&sh, &svc, &mut child).await;
                     break false;
                 }
-                _ = restart.notified() => {
+                Ok(()) = restart.changed() => {
                     ready.send_replace(false);
                     sh.out.info(&format!("{}: restarting", svc.name));
                     stop_child(&sh, &svc, &mut child).await;
@@ -404,7 +427,7 @@ async fn wait_for_restart(
     svc: &Service,
     success: bool,
     backoff: &mut Duration,
-    restart: &Notify,
+    restart: &mut RestartRx,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     if restarts_by_itself(svc.restart, success) {
@@ -413,12 +436,12 @@ async fn wait_for_restart(
         sh.out.info(&format!("{}: restarting in {}s (restart: {:?})", svc.name, delay.as_secs(), svc.restart));
         tokio::select! {
             _ = tokio::time::sleep(delay) => true,
-            _ = restart.notified() => true,
+            Ok(()) = restart.changed() => true,
             _ = shutdown.changed() => false,
         }
     } else {
         tokio::select! {
-            _ = restart.notified() => true,
+            Ok(()) = restart.changed() => true,
             _ = shutdown.changed() => false,
         }
     }
@@ -546,6 +569,7 @@ async fn stop_child(sh: &Shared, svc: &Service, child: &mut Child) {
     sh.update(&svc.name, |s| {
         s.status = "stopped".into();
         s.pid = None;
+        s.pid_start = None;
         s.last_exit = Some(desc);
     });
 }
@@ -603,6 +627,63 @@ mod tests {
         assert!(!http_ok(canned(&[b"garbage"]).await, "/").await.unwrap());
         // A status line that arrives in pieces is still read whole.
         assert!(http_ok(canned(&[b"HTT", b"P/1.1 2", b"00 OK\r\n\r\n"]).await, "/").await.unwrap());
+    }
+
+    fn sleeper(name: &str, depends_on: &[&str]) -> Service {
+        Service {
+            name: name.into(),
+            binary: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            workdir: std::env::temp_dir(),
+            env: vec![],
+            ip: Ipv4Addr::LOCALHOST,
+            networks: vec![],
+            ports: vec![],
+            restart: RestartPolicy::No,
+            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            stop_timeout: 2,
+            healthcheck: None,
+            hosts: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_requested_before_the_service_started_does_not_fire_later() {
+        let dir = std::env::temp_dir().join(format!("ncompose-sup-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths::new(&dir);
+        std::fs::create_dir_all(paths.logs()).unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let dep_ready = watch::channel(false).0;
+        let sh = Arc::new(Shared {
+            paths,
+            state: Mutex::new(State::default()),
+            out: Output { console: false, color: false, width: 8 },
+            shim: "/nonexistent/libncompose_shim.dylib".into(),
+            shutdown,
+            ready: HashMap::from([("db".to_string(), dep_ready.clone()), ("api".to_string(), watch::channel(false).0)]),
+            dns: HashMap::new(),
+        });
+        let (restart, rx) = watch::channel(0u64);
+        let task = tokio::spawn(service_loop(sh.clone(), sleeper("api", &["db"]), 0, rx));
+
+        // `ncompose restart api` while api still waits for db.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        restart.send_modify(|g| *g += 1);
+        dep_ready.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let api = sh.state.lock().unwrap().services["api"].clone();
+        assert_eq!(api.status, "running");
+        assert_eq!(api.restarts, 0, "the early request must not restart the fresh service");
+
+        // A request made while it runs does restart it.
+        restart.send_modify(|g| *g += 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(sh.state.lock().unwrap().services["api"].restarts, 1);
+
+        stop.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

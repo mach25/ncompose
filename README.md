@@ -63,8 +63,9 @@ ncompose injects a small interposition library into each service and rewrites th
 | `bind` | `0.0.0.0`, `127.0.0.1`, `::`, `::1` → the service's own IP (port kept). Dual-stack IPv6 sockets get `::ffff:<ip>`; explicitly v6-only sockets get `EADDRNOTAVAIL`, as on a host without IPv6. A wildcard bind to port 0 (a client socket) is left alone. |
 | `connect`, `sendto`, `sendmsg` | `127.0.0.1` / `::1` → the service's own IP. Sockets talking to `127/8` get the service's IP as source, so peers see who is calling. |
 | `getaddrinfo`, `gethostbyname` | Names of services sharing a network → their IPs. Everything else passes through. |
-| UDP to port 53 | Redirected to the service's embedded resolver, for resolvers that bypass libc (Netty, c-ares, …). It answers service names and forwards everything else to the host's nameservers, like Docker's `127.0.0.11`. `recvfrom`/`recvmsg` report replies as coming from the nameserver that was asked. |
+| UDP to port 53 | Redirected to the service's embedded resolver, for resolvers that bypass libc (Netty, c-ares, …). It answers service names and forwards everything else to the host's nameservers, like Docker's `127.0.0.11`. `recvfrom`/`recvmsg` report each reply as coming from the nameserver its query asked (matched by DNS transaction ID). |
 | `getpeername` | The service's own IP → `127.0.0.1`, hiding the `localhost` rewrite. |
+| `close` | Forgets the socket's DNS bookkeeping, since the descriptor number gets reused. |
 
 The design notes are in [`macos-native-compose.md`](macos-native-compose.md).
 
@@ -142,7 +143,7 @@ service name.
 |---|---|
 | `ncompose up` | Start everything in the foreground with colour-prefixed logs; Ctrl-C stops (twice: kill). |
 | `ncompose up -d [--wait [--timeout S]]` | Start in the background. With `--wait`, return once every service is healthy (or running, without a healthcheck); exit non-zero if one dies first. |
-| `ncompose down [--remove-aliases]` | Stop the project. |
+| `ncompose down [--remove-aliases]` | Stop the project. Aliases `up` added with sudo are removed with `--remove-aliases` here or on `up`. |
 | `ncompose ps` | Services, IPs, PIDs, status, restarts, ports. |
 | `ncompose logs [-f] [-n N] [service…]` | Logs, also kept in `.ncompose/logs/`. |
 | `ncompose restart [service…]` | Restart services (all, if none named). |

@@ -63,12 +63,10 @@ fn daemon_plist_path() -> PathBuf {
     PathBuf::from(format!("/Library/LaunchDaemons/{DAEMON_LABEL}.plist"))
 }
 
-/// Usable host addresses of a CIDR pool (.2 .. broadcast-1, matching allocation).
+/// Usable host addresses of a CIDR pool: exactly those `up` allocates from it.
 pub fn pool_addrs(cidr: &str) -> Result<Vec<Ipv4Addr>> {
     let (net, prefix) = crate::config::parse_subnet(cidr)?;
-    let base = u32::from(net);
-    let size = 1u32 << (32 - prefix);
-    Ok((2..size - 1).map(|i| Ipv4Addr::from(base + i)).collect())
+    Ok(crate::config::host_addrs(net, prefix).collect())
 }
 
 fn plist(pools: &[String]) -> Result<String> {
